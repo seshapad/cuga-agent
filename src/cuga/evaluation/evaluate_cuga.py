@@ -1,5 +1,13 @@
 from cuga.backend.activity_tracker.tracker import ActivityTracker
 from cuga.backend.cuga_graph.utils.controller import AgentRunner, ExperimentResult
+from cuga.backend.llm.models import LLMManager
+from cuga.config import settings
+from cuga.evaluation.agentic_quality_judge import (
+    enable_tool_call_tracking,
+    extract_tool_calls_with_results,
+    fetch_tool_catalog,
+    score_agentic_quality,
+)
 from cuga.evaluation.langfuse.get_langfuse_data import LangfuseTraceHandler
 
 from loguru import logger
@@ -133,25 +141,143 @@ def parse_test_cases(json_file_path: str) -> dict[Any, list[Any]]:
     return test_cases
 
 
-async def run_cuga(test_file_path: str, result_file_path: str) -> (List[TestCase], List[ExperimentResult]):
+def _run_test_case_hook(hook_file: Optional[str], test_case_name: Optional[str]) -> None:
+    """Write the about-to-run (or, with None, the just-finished) test case's
+    name to `hook_file`, if set. Lets an external test double (e.g. a mock
+    MCP server replaying recorded fixtures) scope its own per-call lookups to
+    THIS test case instead of falling through to whichever test case's data
+    happens to be recorded first for a given tool -- a plain file rather than
+    an HTTP call, since a mock registered as a real MCP server only serves
+    the MCP/SSE protocol on its port, not arbitrary side-channel routes.
+    Best-effort and non-fatal: a run should proceed even if the path isn't
+    writable, just without test-case-scoped replay."""
+    if not hook_file:
+        return
+    try:
+        Path(hook_file).write_text(test_case_name or "", encoding="utf-8")
+    except OSError as e:
+        print(f"  WARNING: could not write test-case hook file {hook_file!r}: {e}")
+
+
+def _corrected_tool_calls_for_scoring(agentic_tool_calls) -> List[ToolCall]:
+    """Rebuild the actual-call ToolCall list from extract_tool_calls_with_results()'s
+    tracking-based output, for tool_call_score's exact-match comparison --
+    replaces the broken "api_call"-step-based extraction in parse_test_results()
+    (CugaLite's fast-execution path doesn't emit steps named that way, so that
+    extraction always finds zero calls; confirmed directly against a call that
+    genuinely succeeded). Strips the f"{app_name}_" prefix CUGA's registry adds
+    to callable names (e.g. "agri_mock_generatetoken"), since
+    expected_output.tool_calls uses bare OpenAPI operationIds
+    ("generateToken") -- score_tool_calls_exact only sanitizes (lowercases)
+    the expected side, so the actual side must already be in that bare form
+    to have any chance of matching."""
+    calls = []
+    for c in agentic_tool_calls:
+        name = c.get("tool", "")
+        app_name = c.get("app_name", "")
+        if app_name and name.startswith(app_name + "_"):
+            name = name[len(app_name) + 1 :]
+        calls.append(ToolCall(name=name, args=c.get("arguments") or {}))
+    return calls
+
+
+async def run_cuga(
+    test_file_path: str,
+    result_file_path: str,
+    compute_agentic_quality: bool = False,
+    test_case_hook_file: Optional[str] = None,
+) -> (List[TestCase], List[ExperimentResult]):
     test_cases = parse_test_cases(test_file_path)
     print(f"test cases: {len(test_cases)}\napps: {list(test_cases.keys())}")
-    agent_runner = AgentRunner(browser_enabled=False)
+
+    # Must happen before any AgentRunner is constructed -- it monkeypatches
+    # AgentLoop.__init__ (the class, once, process-wide) so every graph
+    # invocation carries real tool-call results, which score_agentic_quality's
+    # judge needs (the "api_call" tracker steps used below for tool_call_score
+    # carry name+args only).
+    if compute_agentic_quality:
+        enable_tool_call_tracking()
+
+    # Legacy default (compute_agentic_quality=False): one AgentRunner shared
+    # across every task, exactly as upstream always did -- untouched, so
+    # `cuga evaluate` without --agentic-quality behaves identically to before
+    # this flag existed. Only under --agentic-quality do we give each task
+    # its own AgentRunner (see per-task construction below) -- shared-runner
+    # reuse across a long run was observed to make the SAME test case's tool
+    # calls degrade (e.g. dropped arguments) depending on how many prior
+    # tasks had already run through it, even though each task already gets
+    # a fresh compiled graph/checkpointer either way. Root cause unconfirmed;
+    # giving --agentic-quality runs a fresh AgentRunner + unique thread_id
+    # per task removes the shared-identity surface regardless of the exact
+    # mechanism. Scoped to --agentic-quality only so the default path's
+    # behavior/cost is never affected by this.
+    shared_agent_runner = None if compute_agentic_quality else AgentRunner(browser_enabled=False)
+
+    tool_catalog = ""
+    judge_model = None
+    if compute_agentic_quality:
+        # Registry is already up by the time `cuga evaluate` invokes this
+        # script (see cli/main.py::evaluate) -- fetch the tool catalog once,
+        # it's the same for every test case in this run.
+        tool_catalog = await fetch_tool_catalog(settings.server_ports.registry)
+        judge_model = LLMManager().get_model({"platform": "openai", "temperature": 0, "max_tokens": 2000})
+
     results = []
     for app in test_cases:
         task_ids = [f"{app}_{str(i)}" for i in enumerate(test_cases[app])]
         tracker.start_experiment(task_ids=task_ids, experiment_name=app, description="")
         for i, task in enumerate(test_cases[app]):
             try:
+                agent_runner = shared_agent_runner or AgentRunner(
+                    browser_enabled=False, thread_id=f"{app}_{i}"
+                )
+                _run_test_case_hook(test_case_hook_file, task.name)
                 tracker.reset(intent=task.intent, task_id=f"{app}_{str(i)}")
                 result = await agent_runner.run_task_generic(
                     eval_mode=False, goal=task.intent, current_datetime=tracker.current_date
                 )
                 # Reset variables after task completion using the current state
                 state = agent_runner.get_current_state()
+                agentic_tool_calls = extract_tool_calls_with_results(state) if compute_agentic_quality else []
+                if os.environ.get("CUGA_EVAL_DEBUG_AGENTIC"):
+                    print(f"DEBUG[{task.name}] raw state.tool_calls = {state.tool_calls!r}")
+                    print(f"DEBUG[{task.name}] extracted agentic_tool_calls = {agentic_tool_calls!r}")
                 state.variables_manager.reset()
                 results.append(result)
                 parsed_results = parse_test_results([task], [result])
+                if compute_agentic_quality:
+                    corrected_tool_calls = _corrected_tool_calls_for_scoring(agentic_tool_calls)
+                    corrected_score, corrected_details = evaluate_test_and_details(
+                        task.expected_output.keywords,
+                        corrected_tool_calls,
+                        task.expected_output.tool_calls,
+                        result.answer or "",
+                        task.expected_output.response,
+                    )
+                    parsed_results[0].score.tool_call_score = corrected_score.tool_call_score
+                    parsed_results[0].details.tool_call_mismatches = corrected_details.tool_call_mismatches
+                    if os.environ.get("CUGA_EVAL_DEBUG_AGENTIC"):
+                        print(
+                            f"DEBUG[{task.name}] corrected tool_call_score = {corrected_score.tool_call_score!r}, "
+                            f"mismatches = {corrected_details.tool_call_mismatches!r}"
+                        )
+                    judge_results, _aggregate = score_agentic_quality(
+                        judge_model,
+                        [
+                            {
+                                "question": task.intent,
+                                "tool_calls": agentic_tool_calls,
+                                "answer": result.answer or "",
+                            }
+                        ],
+                        tool_catalog,
+                    )
+                    if os.environ.get("CUGA_EVAL_DEBUG_AGENTIC"):
+                        print(f"DEBUG[{task.name}] judge_results = {judge_results!r}")
+                    parsed_results[0].score.tool_selection_quality = judge_results[0].get(
+                        "tool_selection_quality"
+                    )
+                    parsed_results[0].score.action_advancement = judge_results[0].get("action_advancement")
                 save_test_results(parsed_results, result_file_path)
                 # Extract langfuse trace ID (applicable only if `langfuse_tracing=true` in settings)
                 langfuse_trace_id = agent_runner.agent_loop_obj.get_langfuse_trace_id()
@@ -193,6 +319,7 @@ async def run_cuga(test_file_path: str, result_file_path: str) -> (List[TestCase
                 )
                 logger.error(traceback.format_exc())
                 logger.error(e)
+    _run_test_case_hook(test_case_hook_file, None)
     return test_cases, results
 
 
@@ -274,6 +401,12 @@ def save_test_results(
                 "keyword_score": r.score.keyword_score,
                 "tool_call_score": r.score.tool_call_score,
                 "response_score": r.score.response_score,
+                # Only populated when `cuga evaluate --agentic-quality` ran the judge;
+                # None otherwise (see TestScore in calculate_test_score.py). The full
+                # per-step judge output (reasons, per-step verdicts) is JSON-only --
+                # too verbose for a CSV column, kept here as just the top-level label.
+                "tool_selection_quality_label": (r.score.tool_selection_quality or {}).get("label"),
+                "action_advancement_label": (r.score.action_advancement or {}).get("label"),
                 "expected_keywords": j(r.details.expected_keywords),
                 "missing_keywords": j(r.details.missing_keywords),
                 "tool_call_mismatches": j([m.model_dump() for m in r.details.tool_call_mismatches]),
@@ -296,12 +429,32 @@ def save_test_results(
 if __name__ == "__main__":
     import asyncio
     import argparse
-    from cuga.config import settings
 
     settings.update({"ADVANCED_FEATURES": {"TRACKER_ENABLED": True}}, merge=True)
     parser = argparse.ArgumentParser(description="Run tests and save results.")
     parser.add_argument("-t", "--test-file-path", required=True, help="Path to the test file")
     parser.add_argument("-r", "--result-file-path", required=True, help="Path to the result file")
+    parser.add_argument(
+        "-a",
+        "--agentic-quality",
+        action="store_true",
+        help="Also score tool_selection_quality/action_advancement with an LLM judge "
+        "over real tool-call trajectories (adds judge-model latency/cost per test case).",
+    )
+    parser.add_argument(
+        "--test-case-hook-file",
+        default=None,
+        help="Path to write the current test case's name to before each task, and clear "
+        "afterward -- lets an external test double (e.g. a mock MCP server) scope its own "
+        "replay to this test case. Omit for no hook.",
+    )
 
     args = parser.parse_args()
-    tasks, results = asyncio.run(run_cuga(args.test_file_path, args.result_file_path))
+    tasks, results = asyncio.run(
+        run_cuga(
+            args.test_file_path,
+            args.result_file_path,
+            compute_agentic_quality=args.agentic_quality,
+            test_case_hook_file=args.test_case_hook_file,
+        )
+    )

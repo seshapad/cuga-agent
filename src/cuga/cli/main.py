@@ -2370,6 +2370,20 @@ def evaluate(
         default="results.json",
         help="Path to your output file, it defaults to 'results.json'",
     ),
+    agentic_quality: bool = typer.Option(
+        False,
+        "--agentic-quality",
+        help="Also score tool_selection_quality/action_advancement with an LLM judge "
+        "over each test case's real tool-call trajectory. Off by default: adds "
+        "judge-model latency/cost per test case.",
+    ),
+    test_case_hook_file: Optional[str] = typer.Option(
+        None,
+        "--test-case-hook-file",
+        help="Path to write the current test case's name to before each task (and clear "
+        "afterward) -- lets an external test double, e.g. a mock MCP server, scope its own "
+        "replay to this test case. Omit for no hook.",
+    ),
 ):
     """
     Run Cuga on your test cases.
@@ -2406,21 +2420,23 @@ def evaluate(
             wait_for_registry_server(settings.server_ports.registry)
 
             # Then start demo - using explicit fastapi command
-            run_direct_service(
-                "evaluation",
-                [
-                    "uv",
-                    "run",
-                    "--no-sync",
-                    "--group",
-                    "dev",
-                    os.path.join(PACKAGE_ROOT, "evaluation/evaluate_cuga.py"),
-                    "-t",
-                    test_cases_file_path,
-                    "-r",
-                    output_file_path,
-                ],
-            )
+            evaluate_cuga_args = [
+                "uv",
+                "run",
+                "--no-sync",
+                "--group",
+                "dev",
+                os.path.join(PACKAGE_ROOT, "evaluation/evaluate_cuga.py"),
+                "-t",
+                test_cases_file_path,
+                "-r",
+                output_file_path,
+            ]
+            if agentic_quality:
+                evaluate_cuga_args.append("--agentic-quality")
+            if test_case_hook_file:
+                evaluate_cuga_args.extend(["--test-case-hook-file", test_case_hook_file])
+            run_direct_service("evaluation", evaluate_cuga_args)
         wait_for_direct_processes()
 
     except Exception as e:
