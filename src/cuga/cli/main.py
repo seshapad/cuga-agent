@@ -2443,6 +2443,7 @@ def evaluate(
         if judge_model:
             judge_env["CUGA_JUDGE_MODEL"] = judge_model
     # start the registry
+    evaluation_process = None
     try:
         run_direct_service(
             "registry",
@@ -2490,13 +2491,27 @@ def evaluate(
                 evaluate_cuga_args.append("--agentic-quality")
             if test_case_hook_file:
                 evaluate_cuga_args.extend(["--test-case-hook-file", test_case_hook_file])
-            run_direct_service("evaluation", evaluate_cuga_args, env_vars=judge_env or None)
-        wait_for_direct_processes()
+            evaluation_process = run_direct_service(
+                "evaluation", evaluate_cuga_args, env_vars=judge_env or None
+            )
+        if evaluation_process is None:
+            wait_for_direct_processes()
+        else:
+            # The registry is a server that never exits on its own, so waiting
+            # for every direct process would hang here forever once the
+            # evaluation is done. Wait for the evaluation, then stop the registry.
+            try:
+                evaluation_process.wait()
+            finally:
+                stop_direct_processes()
 
     except Exception as e:
         logger.error(f"Error starting registry service: {e}")
         stop_direct_processes()
         raise typer.Exit(1)
+    if evaluation_process is not None and evaluation_process.returncode:
+        logger.error(f"Evaluation exited with code {evaluation_process.returncode}")
+        raise typer.Exit(evaluation_process.returncode)
     return
 
 
