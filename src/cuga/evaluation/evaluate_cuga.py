@@ -1,8 +1,9 @@
 from cuga.backend.activity_tracker.tracker import ActivityTracker
 from cuga.backend.cuga_graph.utils.controller import AgentRunner, ExperimentResult
-from cuga.backend.llm.models import LLMManager
 from cuga.config import settings
 from cuga.evaluation.agentic_quality_judge import (
+    JudgeConfig,
+    build_judge,
     enable_tool_call_tracking,
     extract_tool_calls_with_results,
     fetch_tool_catalog,
@@ -186,7 +187,16 @@ async def run_cuga(
     result_file_path: str,
     compute_agentic_quality: bool = False,
     test_case_hook_file: Optional[str] = None,
+    judge_config: Optional[JudgeConfig] = None,
 ) -> (List[TestCase], List[ExperimentResult]):
+    # Resolve and health-check the judge backend before running any test case,
+    # so a bad --judge-url fails the run immediately instead of after every
+    # agent task has already run (and every judge label has come back "NA").
+    judge_model = None
+    if compute_agentic_quality:
+        judge_model = build_judge(judge_config or JudgeConfig.from_env())
+        print(f"agentic_quality judge: {judge_model.model_name} @ {judge_model.openai_api_base}")
+
     test_cases = parse_test_cases(test_file_path)
     print(f"test cases: {len(test_cases)}\napps: {list(test_cases.keys())}")
 
@@ -214,13 +224,11 @@ async def run_cuga(
     shared_agent_runner = None if compute_agentic_quality else AgentRunner(browser_enabled=False)
 
     tool_catalog = ""
-    judge_model = None
     if compute_agentic_quality:
         # Registry is already up by the time `cuga evaluate` invokes this
         # script (see cli/main.py::evaluate) -- fetch the tool catalog once,
         # it's the same for every test case in this run.
         tool_catalog = await fetch_tool_catalog(settings.server_ports.registry)
-        judge_model = LLMManager().get_model({"platform": "openai", "temperature": 0, "max_tokens": 2000})
 
     results = []
     for app in test_cases:
@@ -449,12 +457,31 @@ if __name__ == "__main__":
         "replay to this test case. Omit for no hook.",
     )
 
+    parser.add_argument(
+        "--judge-url",
+        default=None,
+        help="OpenAI-compatible API root of the agentic_quality judge, used as-is (vLLM, OpenAI, "
+        "LiteLLM, Ollama, ..., e.g. http://vllm-judge:8000/v1). Defaults to $CUGA_JUDGE_BASE_URL. "
+        "Separate from CUGA's agent model.",
+    )
+    parser.add_argument(
+        "--judge-model",
+        default=None,
+        help="Judge model name. Defaults to $CUGA_JUDGE_MODEL, else the first model the server lists.",
+    )
+
     args = parser.parse_args()
+    judge_config = (
+        JudgeConfig.from_env(base_url=args.judge_url, model=args.judge_model)
+        if args.agentic_quality
+        else None
+    )
     tasks, results = asyncio.run(
         run_cuga(
             args.test_file_path,
             args.result_file_path,
             compute_agentic_quality=args.agentic_quality,
             test_case_hook_file=args.test_case_hook_file,
+            judge_config=judge_config,
         )
     )

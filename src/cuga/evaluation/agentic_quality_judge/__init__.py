@@ -14,6 +14,9 @@ Public API:
   real results (call once, before constructing AgentRunner).
 - extract_tool_calls_with_results(state) -- reads those results back off a
   finished AgentState.
+- JudgeConfig.from_env() / build_judge(config) -- the judge model: any
+  OpenAI-compatible backend (vLLM, OpenAI, LiteLLM, Ollama, ...), configured independently of
+  CUGA's agent backbone model (see judge_client.py).
 - score_agentic_quality(model, records, tool_catalog) -- the LLM judge
   itself; records = [{"question", "tool_calls", "answer"}, ...].
 """
@@ -21,6 +24,7 @@ Public API:
 from .catalog import fetch_tool_catalog
 from .tracking import enable_tool_call_tracking, extract_tool_calls_with_results
 from .scoring import score_agentic_quality, get_metrics
+from .judge_client import JudgeConfig, JudgeConfigError, build_judge
 
 __all__ = [
     "fetch_tool_catalog",
@@ -28,4 +32,7 @@ __all__ = [
     "extract_tool_calls_with_results",
     "score_agentic_quality",
     "get_metrics",
+    "JudgeConfig",
+    "JudgeConfigError",
+    "build_judge",
 ]

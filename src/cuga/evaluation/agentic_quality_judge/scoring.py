@@ -1,6 +1,7 @@
 """LLM-judge scoring for CUGA agent trajectories: tool_selection_quality and
-action_advancement. The judge LLM is CUGA's own configured backbone model
-(see cuga.backend.llm.models.LLMManager) -- callers construct and pass it in.
+action_advancement. The judge LLM is any OpenAI-compatible backend (e.g. a
+remote vLLM service), deliberately separate from CUGA's own backbone model --
+callers build it with judge_client.build_judge() and pass it in.
 
 Ported from harness_eval/agentic_quality_evaluator/scoring_function.py,
 trimmed to what `cuga evaluate --agentic-quality` actually calls (dropped
@@ -102,7 +103,9 @@ def process_single_input_tool_selection_quality(record, model):
         if record["tool_calls"] in ("", "[]", []):
             return {"label": "NA", "steps": [], "reason": "No tool calls"}
         full_query = f"User Question: {record['question']}"
-        return get_tool_selection_quality(model, full_query, record["tool_calls"], record.get("tool_catalog", ""))
+        return get_tool_selection_quality(
+            model, full_query, record["tool_calls"], record.get("tool_catalog", "")
+        )
     except ValueError as e:
         return {"label": "NA", "steps": [], "reason": f"Error: ValueError: {str(e)}"}
     except Exception as e:
@@ -151,7 +154,9 @@ def get_action_advancement(model, QUESTION, TOOL_RESULTS, ANSWER):
 {ANSWER}
 </assistant_response>"""
 
-    tool_results_str = TOOL_RESULTS if isinstance(TOOL_RESULTS, str) else json.dumps(TOOL_RESULTS, default=str)
+    tool_results_str = (
+        TOOL_RESULTS if isinstance(TOOL_RESULTS, str) else json.dumps(TOOL_RESULTS, default=str)
+    )
     user_prompt = (
         input_prompt.replace("{QUESTION}", QUESTION)
         .replace("{TOOL_RESULTS}", tool_results_str)
