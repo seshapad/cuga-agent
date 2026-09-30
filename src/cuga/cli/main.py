@@ -2384,10 +2384,37 @@ def evaluate(
         "afterward) -- lets an external test double, e.g. a mock MCP server, scope its own "
         "replay to this test case. Omit for no hook.",
     ),
+    judge_url: Optional[str] = typer.Option(
+        None,
+        "--judge-url",
+        help="OpenAI-compatible API root of the --agentic-quality judge, used as-is (vLLM, "
+        "OpenAI, LiteLLM, Ollama, ..., e.g. http://vllm-judge:8000/v1). Defaults to "
+        "$CUGA_JUDGE_BASE_URL. The judge is configured separately from Cuga's agent model; set "
+        "$CUGA_JUDGE_API_KEY and/or $CUGA_JUDGE_HEADERS (JSON) if the backend needs auth.",
+    ),
+    judge_model: Optional[str] = typer.Option(
+        None,
+        "--judge-model",
+        help="Judge model name. Defaults to $CUGA_JUDGE_MODEL, else the first model the server lists.",
+    ),
 ):
     """
     Run Cuga on your test cases.
     """
+    judge_env = {}
+    if agentic_quality:
+        judge_url = judge_url or os.environ.get("CUGA_JUDGE_BASE_URL")
+        if not judge_url:
+            logger.error(
+                "--agentic-quality needs a judge model: pass --judge-url or set CUGA_JUDGE_BASE_URL "
+                "(the judge is intentionally separate from Cuga's agent model)."
+            )
+            raise typer.Exit(1)
+        # Passed to evaluate_cuga.py via env rather than argv so the judge's
+        # CUGA_JUDGE_API_KEY (inherited from this env) never appears in a process list.
+        judge_env["CUGA_JUDGE_BASE_URL"] = judge_url
+        if judge_model:
+            judge_env["CUGA_JUDGE_MODEL"] = judge_model
     # start the registry
     try:
         run_direct_service(
@@ -2436,7 +2463,7 @@ def evaluate(
                 evaluate_cuga_args.append("--agentic-quality")
             if test_case_hook_file:
                 evaluate_cuga_args.extend(["--test-case-hook-file", test_case_hook_file])
-            run_direct_service("evaluation", evaluate_cuga_args)
+            run_direct_service("evaluation", evaluate_cuga_args, env_vars=judge_env or None)
         wait_for_direct_processes()
 
     except Exception as e:
