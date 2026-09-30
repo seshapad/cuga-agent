@@ -1,6 +1,7 @@
 """LLM-judge scoring for CUGA agent trajectories: tool_selection_quality and
-action_advancement. The judge LLM is CUGA's own configured backbone model
-(see cuga.backend.llm.models.LLMManager) -- callers construct and pass it in.
+action_advancement. The judge LLM is any OpenAI-compatible backend (e.g. a
+remote vLLM service), deliberately separate from CUGA's own backbone model --
+callers build it with judge_client.build_judge() and pass it in.
 
 Ported from harness_eval/agentic_quality_evaluator/scoring_function.py,
 trimmed to what `cuga evaluate --agentic-quality` actually calls (dropped
